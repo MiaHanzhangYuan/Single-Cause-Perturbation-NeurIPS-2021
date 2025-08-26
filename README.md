@@ -42,31 +42,3 @@ python -u -m run_simulation --method=scp --config=real_full  | tee results/scp_r
 An implementation of SCP is provided in `run_simulation_scp.py`.  
 In this implementation, we use **DR-CFR** in step one and **neural network regression** in step two.
 
----
-
-## Project Structure
-
-```text
-.
-├─ real_data/                # place cause.csv, confounder.csv, outcome.csv here
-├─ results/                  # experiment logs and outputs (created on first run)
-├─ run_simulation_scp.py     # SCP reference implementation
-├─ run_simulation.py         # experiment launcher (entry point)
-├─ requirement_new.txt       # Python dependencies
-└─ README.md                 # this file
-```
-
----
-
-## Citation
-
-If you find this repository useful, please cite the NeurIPS 2021 paper:
-
-```bibtex
-@inproceedings{qian2021scp,
-  title     = {Estimating Multi-cause Treatment Effects via Single-cause Perturbation},
-  author    = {Qian, Zhaozhi and Yuan, Mia Hanzhang and others},
-  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
-  year      = {2021}
-}
-```
