@@ -1,41 +1,72 @@
 # Estimating Multi-cause Treatment Effects via Single-cause Perturbation (NeurIPS 2021)
 
-Single-cause Perturbation (SCP) is a framework to estimate the multi-cause conditional average treatment effect (CATE) from observational data.
+**Single-cause Perturbation (SCP)** is a framework for estimating the *multi-cause conditional average treatment effect (CATE)* from observational data.
 
-Most existing CATE estimation methods are designed for *single cause* interventions, i.e. only one variable can be intervened on at one time.  However, many applications involve simultaneous intervention on multiple variables. This is the *multi-cause* estimation problem addressed by SCP.
+Most existing CATE methods assume *single-cause* interventions, i.e., only one variable can be manipulated at a time. However, many real-world applications involve interventions on *multiple causes simultaneously*. SCP addresses this challenge by:
+- Leveraging the link between single- and multi-cause interventions.
+- Using **data augmentation** to mitigate confounding bias.
+- Avoiding strong assumptions on the distribution or functional form of the data-generating process (DGP).
 
-SCP leverages the connection between single and multi-cause interventions and overcomes the confounding bias via data augmentation. 
-Compared with existing works, SCP does not make assumptions about the distributional or functional form of the DGP.
+---
 
-## Usage 
+## Installation
 
-To run the code locally, make sure to first install the required python packages specified in `requirements.txt`. Python 3.6+ is recommended (the code has been tested with Python 3.7).
+```bash
+conda create -n scp38 python=3.8 -y
+conda activate scp38
+pip install -r requirement_new.txt
+```
 
-All the experiments scripts are located under [`experiments/`](./experiments/).
-The `reproduce_all.sh` shell script contains commands to reproduce *all* synthetic data tables and figures in the paper.
-The `reproduce_real.sh` shell script contains commands to reproduce *all* real data tables and figures in the paper.
-The `Fig[x].sh` or `Tab[x].sh`  shell script contain commands to generate results for individual figures or tables.
-The `Fig[x].ipynb` notebooks contain commands to create the visualizations.
+---
 
-An implementation of SCP is provided in the file `run_simulation_scp.py`.
-Note that SCP is a general framework agnostic to the exact choice of step one and step two estimators.
-In this implementation, we use DR-CFR in step one and neural network regression in step two.
-The benchmarks are implemented in the files `benchmarks/run_simulation_[x].py`.
+## Data Preparation
+
+Place the real datasets under `real_data/`:
+- `cause.csv`
+- `confounder.csv`
+- `outcome.csv`
+
+---
+
+## Running Experiments
+
+Start with smaller samples and then scale up to the full dataset:
+
+```bash
+python -u -m run_simulation --method=scp --config=real_500   | tee results/scp_real_500.txt
+python -u -m run_simulation --method=scp --config=real_1000  | tee results/scp_real_1000.txt
+python -u -m run_simulation --method=scp --config=real_1500  | tee results/scp_real_1500.txt
+python -u -m run_simulation --method=scp --config=real_full  | tee results/scp_real_full.txt
+```
+
+An implementation of SCP is provided in `run_simulation_scp.py`.  
+In this implementation, we use **DR-CFR** in step one and **neural network regression** in step two.
+
+---
+
+## Project Structure
+
+```text
+.
+├─ real_data/                # place cause.csv, confounder.csv, outcome.csv here
+├─ results/                  # experiment logs and outputs (created on first run)
+├─ run_simulation_scp.py     # SCP reference implementation
+├─ run_simulation.py         # experiment launcher (entry point)
+├─ requirement_new.txt       # Python dependencies
+└─ README.md                 # this file
+```
+
+---
 
 ## Citation
 
-If you find the software useful, please consider citing the following paper:
+If you find this repository useful, please cite the NeurIPS 2021 paper:
 
-```
-@inproceedings{scp2021,
-  title={Estimating Multi-cause Treatment Effects via Single-cause Perturbation},
-  author={Qian, Zhaozhi and Curth, Alicia and van der Schaar, Mihaela},
-  booktitle={Advances in neural information processing systems},
-  year={2021}
+```bibtex
+@inproceedings{qian2021scp,
+  title     = {Estimating Multi-cause Treatment Effects via Single-cause Perturbation},
+  author    = {Qian, Zhaozhi and Yuan, Mia Hanzhang and others},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2021}
 }
 ```
-
-## License
-Copyright 2021, Zhaozhi Qian.
-
-This software is released under the MIT license.
