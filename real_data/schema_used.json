@@ -1,0 +1,202 @@
+{
+  "N": 1266,
+  "outcome": {
+    "name": "ORN",
+    "counts": {
+      "0": 1231,
+      "1": 35
+    },
+    "type": "binary"
+  },
+  "confounders": [
+    {
+      "name": "Sex",
+      "type": "binary",
+      "counts": {
+        "0": 327,
+        "1": 939
+      }
+    },
+    {
+      "name": "Chemotherapy",
+      "type": "binary",
+      "counts": {
+        "0": 430,
+        "1": 593
+      }
+    },
+    {
+      "name": "Hypertension",
+      "type": "binary",
+      "counts": {
+        "0": 510,
+        "1": 513
+      }
+    },
+    {
+      "name": "Diabetes",
+      "type": "binary",
+      "counts": {
+        "0": 877,
+        "1": 146
+      }
+    },
+    {
+      "name": "RTType",
+      "type": "binary",
+      "counts": {
+        "0": 931,
+        "1": 335
+      }
+    },
+    {
+      "name": "Bisphosphonate",
+      "type": "binary",
+      "counts": {
+        "0": 1005,
+        "1": 17
+      }
+    },
+    {
+      "name": "Smoker",
+      "type": "binary",
+      "counts": {
+        "0": 490,
+        "1": 423
+      }
+    },
+    {
+      "name": "DentalPrior",
+      "type": "binary",
+      "counts": {
+        "0": 351,
+        "1": 671
+      }
+    },
+    {
+      "name": "RecommendedDentalExtraction",
+      "type": "binary",
+      "counts": {
+        "0": 855,
+        "1": 167
+      }
+    },
+    {
+      "name": "DentalExtractionPerformed",
+      "type": "binary",
+      "counts": {
+        "0": 864,
+        "1": 1
+      }
+    },
+    {
+      "name": "RecurrentCancer",
+      "type": "binary",
+      "counts": {
+        "0": 270,
+        "1": 2
+      }
+    },
+    {
+      "name": "SurgicalIntervention",
+      "type": "binary",
+      "counts": {
+        "0": 11,
+        "1": 18
+      }
+    },
+    {
+      "name": "Smoker_new",
+      "type": "binary",
+      "counts": {
+        "0": 490,
+        "1": 533
+      }
+    },
+    {
+      "name": "Smoker_new2",
+      "type": "binary",
+      "counts": {
+        "0": 914,
+        "1": 109
+      }
+    }
+  ],
+  "treatments": [
+    {
+      "name": "PrescribedDose",
+      "type": "binary",
+      "p": 0.9
+    },
+    {
+      "name": "DeliveredDose",
+      "type": "binary",
+      "p": 0.85
+    },
+    {
+      "name": "ScaledD0_01cc_cGy_",
+      "type": "binary",
+      "p": 0.6
+    },
+    {
+      "name": "ScaledMean_cGy_",
+      "type": "binary",
+      "p": 0.6
+    },
+    {
+      "name": "V40Gy_cc_",
+      "type": "binary",
+      "p": 0.85
+    },
+    {
+      "name": "V50Gy_cc_",
+      "type": "binary",
+      "p": 0.75
+    },
+    {
+      "name": "V60Gy_cc_",
+      "type": "binary",
+      "p": 0.65
+    },
+    {
+      "name": "V70Gy_cc_",
+      "type": "binary",
+      "p": 0.55
+    },
+    {
+      "name": "V75Gy_cc_",
+      "type": "binary",
+      "p": 0.45
+    }
+  ],
+  "order_X": {
+    "Z_first_then_T": true,
+    "Z_names": [
+      "Sex",
+      "Chemotherapy",
+      "Hypertension",
+      "Diabetes",
+      "RTType",
+      "Bisphosphonate",
+      "Smoker",
+      "DentalPrior",
+      "RecommendedDentalExtraction",
+      "DentalExtractionPerformed",
+      "RecurrentCancer",
+      "SurgicalIntervention",
+      "Smoker_new",
+      "Smoker_new2"
+    ],
+    "T_names": [
+      "PrescribedDose",
+      "DeliveredDose",
+      "ScaledD0_01cc_cGy_",
+      "ScaledMean_cGy_",
+      "V40Gy_cc_",
+      "V50Gy_cc_",
+      "V60Gy_cc_",
+      "V70Gy_cc_",
+      "V75Gy_cc_"
+    ]
+  }
+}

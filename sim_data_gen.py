@@ -5,6 +5,8 @@ import pandas as pds
 import torch
 from sklearn.decomposition import PCA
 
+from torch.utils.data import TensorDataset
+        
 from global_config import DEVICE, DTYPE
 from utils import bootstrap_RMSE
 
@@ -466,6 +468,91 @@ class DataGenerator:
         return improvements[:, 0]
 
     def generate_real(self):
+        """
+        读取 real_data/{confounder,cause,outcome}.csv，自适应列数与样本数；
+        若 config.sample_size < N，则稳定随机下采样；按 7/1/2（或传入的 train_frac/val_frac）切分；
+        并缓存 train/val/test 的 confounder/cause/outcome，供 generate_dataset 与 generate_test_real 使用。
+        """
+        import numpy as np
+        import torch
+        import pandas as pds
+        from torch.utils.data import TensorDataset
+
+        # 1) 读入三张 CSV
+        conf = pds.read_csv("real_data/confounder.csv").values  # [N, Z]
+        cause = pds.read_csv("real_data/cause.csv").values      # [N, T]
+        out   = pds.read_csv("real_data/outcome.csv").values    # [N, Y]
+
+        # 2) 形状检查
+        assert conf.ndim == 2 and cause.ndim == 2 and out.ndim == 2, "CSV 应为二维表（需包含表头）"
+        N, Z = conf.shape
+        Nt, T = cause.shape
+        No, Y = out.shape
+        assert Nt == N and No == N, f"conf/cause/outcome 行数需一致：conf={N}, cause={Nt}, outcome={No}"
+
+        # 3) 自适应填充配置（当为 0/None 时）
+        if not getattr(self, "n_confounder", None): self.n_confounder = Z
+        else: assert self.n_confounder == Z, f"conf 列数不一致：CSV={Z}, config={self.n_confounder}"
+        if not getattr(self, "n_cause", None): self.n_cause = T
+        else: assert self.n_cause == T, f"cause 列数不一致：CSV={T}, config={self.n_cause}"
+        if not getattr(self, "n_outcome", None): self.n_outcome = Y
+        else: assert self.n_outcome == Y, f"outcome 列数不一致：CSV={Y}, config={self.n_outcome}"
+
+        # 4) 按需下采样（用于 real_500/1000/1500 等）
+        target = getattr(self, "sample_size", None)
+        if not target or target <= 0 or target > N:
+            target = N
+        if target < N:
+            rng = np.random.RandomState(42)  # 稳定复现
+            idx = rng.choice(N, size=target, replace=False)
+            conf, cause, out = conf[idx], cause[idx], out[idx]
+            N = target
+
+        # 5) 基础缓存（float32），全量
+        self.confounder = conf.astype(np.float32)   # [N, Z]
+        self.cause      = cause.astype(np.float32)  # [N, T]
+        self.outcome    = out.astype(np.float32)    # [N, Y]
+        self.sample_size = N
+
+        # 6) 切分比例（默认 0.7/0.1/0.2，或用传入的 train_frac/val_frac）
+        train_frac = getattr(self, "train_frac", 0.7)
+        val_frac   = getattr(self, "val_frac",   0.1)
+        if train_frac <= 0 or train_frac >= 1: train_frac = 0.7
+        if val_frac   < 0 or (train_frac + val_frac) >= 1: val_frac = 0.1
+
+        n_train = int(train_frac * N)
+        n_val   = int(val_frac   * N)
+        n_test  = N - n_train - n_val
+
+        # 7) 切分并缓存（分别保存，供 generate_test_real 使用）
+        self.confounder_train = self.confounder[:n_train]
+        self.confounder_val   = self.confounder[n_train:n_train+n_val]
+        self.confounder_test  = self.confounder[n_train+n_val:]
+
+        self.cause_train = self.cause[:n_train]
+        self.cause_val   = self.cause[n_train:n_train+n_val]
+        self.cause_test  = self.cause[n_train+n_val:]
+
+        self.outcome_train = self.outcome[:n_train]
+        self.outcome_val   = self.outcome[n_train:n_train+n_val]
+        self.outcome_test  = self.outcome[n_train+n_val:]
+
+        # 8) 拼接 X 并构造 TensorDataset
+        X_tr = np.concatenate([self.confounder_train, self.cause_train], axis=1)
+        X_va = np.concatenate([self.confounder_val,   self.cause_val],   axis=1)
+        X_te = np.concatenate([self.confounder_test,  self.cause_test],  axis=1)
+
+        self.train_size, self.val_size, self.test_size = n_train, n_val, n_test
+        self.outcome_list = [self.outcome]  # 保持与下游评估兼容
+
+        import torch
+        from torch.utils.data import TensorDataset
+        self.train_dataset = TensorDataset(torch.tensor(X_tr), torch.tensor(self.outcome_train))
+        self.valid_dataset = TensorDataset(torch.tensor(X_va), torch.tensor(self.outcome_val))
+        self.x_test = torch.tensor(X_te)
+        self.y_test = torch.tensor(self.outcome_test)
+
+    def generate_real0(self):
         # load data
         cause = pds.read_csv("real_data/cause.csv").values
         confounder = pds.read_csv("real_data/confounder.csv").values
@@ -477,7 +564,7 @@ class DataGenerator:
         #
         # self.sample_size = confounder.shape[0]
         # self.train_size = int(tv_sample_size * 0.9)
-        # self.val_size = int(tv_sample_size * 0.1)
+        # self.val_size = int(tv_sample_size * 0.1) 
 
         outcomes = self.generate_real_outcome(cause, confounder, noise=0.1)
         self.cause = cause
@@ -516,7 +603,51 @@ class DataGenerator:
         y_test = self._make_tensor(y_test)
         return train_dataset, valid_dataset, x_test, y_test
 
-    def generate_dataset(self, return_dataset=True, weight=None):
+    def generate_dataset(self):
+        """
+        real_data=True：直接调用 generate_real 并返回拆分后的数据集；
+        否则：走原合成分支（保持你现有逻辑）。
+        """
+        import numpy as np
+        import torch
+        from torch.utils.data import TensorDataset
+
+        if getattr(self, "real_data", False):
+            if not hasattr(self, "train_dataset"):
+                self.generate_real()
+            return self.train_dataset, self.valid_dataset, self.x_test, self.y_test
+
+        # ⬇️ 以下为合成分支（与你原先等价）
+        self.generate()
+        x = np.concatenate((self.confounder, self.cause), axis=-1)
+        y = self.outcome
+        N = x.shape[0]
+
+        train_frac = getattr(self, "train_frac", 0.7)
+        val_frac   = getattr(self, "val_frac",   0.1)
+        if train_frac <= 0 or train_frac >= 1: train_frac = 0.7
+        if val_frac   < 0 or (train_frac + val_frac) >= 1: val_frac = 0.1
+
+        n_train = int(train_frac * N)
+        n_val   = int(val_frac   * N)
+        n_test  = N - n_train - n_val
+
+        x_train, y_train = x[:n_train],                 y[:n_train]
+        x_valid, y_valid = x[n_train:n_train+n_val],    y[n_train:n_train+n_val]
+        x_test,  y_test  = x[n_train+n_val:],           y[n_train+n_val:]
+
+        train_dataset = TensorDataset(torch.tensor(x_train), torch.tensor(y_train))
+        valid_dataset = TensorDataset(torch.tensor(x_valid), torch.tensor(y_valid))
+        x_test_t = torch.tensor(x_test)
+        y_test_t = torch.tensor(y_test)
+
+        self.train_size, self.val_size, self.test_size = n_train, n_val, n_test
+        self.sample_size = N
+
+        return train_dataset, valid_dataset, x_test_t, y_test_t
+
+
+    def generate_dataset0(self, return_dataset=True, weight=None):
         self.generate()
 
         if weight is None:
@@ -800,8 +931,33 @@ class DataGenerator:
             outcome_list.append(this_outcome)
         self.outcome_list = outcome_list
         return new_x_test, cate_test
+    def generate_test_real(self):
+        """
+        为真实数据生成一组“测试集单因子干预”的 X：
+        对测试集的每一列 treatment（cause 的列）逐列翻转（0->1, 1->0），
+        返回一个列表 [X_flip_col0, X_flip_col1, ..., X_flip_col{T-1}]，
+        其中每个元素形状都是 [n_test, Z+T]，与 self.x_test 对齐。
+        """
+        import numpy as np
 
-    def generate_test_real(self, weight=None):
+        assert hasattr(self, "confounder_test") and hasattr(self, "cause_test"), \
+            "请先调用 generate_real() 以构造测试集"
+
+        Z = self.confounder_test.shape[1]
+        T = self.cause_test.shape[1]
+        n_test = self.confounder_test.shape[0]
+        assert self.cause_test.shape[0] == n_test, "测试集行数不一致"
+
+        new_x_list = []
+        for t_idx in range(T):
+            new_cause = self.cause_test.copy()
+            new_cause[:, t_idx] = 1.0 - new_cause[:, t_idx]  # 单列翻转
+            new_x = np.concatenate([self.confounder_test, new_cause], axis=1)
+            new_x_list.append(new_x.astype(np.float32))
+
+        return new_x_list
+
+    def generate_test_real0(self, weight=None):
         new_x_list = []
 
         n_treatment = int(np.power(2, self.n_cause))
@@ -867,8 +1023,117 @@ class DataGenerator:
 
             new_x_list.append(new_x_test)
         return new_x_list
+   
+    def evaluate_real(self, y_list, threshold=0.5, save_path=None):
+        """
+        真实数据：通常没有个体级真值 tau，无法计算 PEHE。
+        本函数：
+        - 如果存在非空的 self.tau（模拟数据），则计算 PEHE（保持向后兼容）
+        - 否则（真实数据），只做预测结果的统计摘要，不再尝试计算 PEHE
 
-    def evaluate_real(self, y_list):
+        Args:
+            y_list: list[np.ndarray]，每个元素是某个干预场景下的预测结果，形状 (N, 1) 或 (N,)
+            threshold: 若预测为概率，按该阈值给出阳性率（默认 0.5）
+            save_path: 若给定字符串路径，则将摘要保存为 CSV
+        """
+        import numpy as _np
+        import pandas as _pd
+
+        # ---- 1) 统一整理形状，拼成 (N, K) 的矩阵 ----
+        if y_list is None or len(y_list) == 0:
+            print("[evaluate_real] y_list 为空，跳过评估。")
+            return None
+
+        cols = []
+        for idx, y in enumerate(y_list):
+            if y is None:
+                continue
+            y = _np.asarray(y)
+            if y.ndim == 0:
+                # 单个标量，跳过
+                continue
+            if y.ndim == 1:
+                y = y.reshape(-1, 1)
+            elif y.ndim >= 2:
+                # 只保留第一列（通常 n_outcome=1）
+                y = y.reshape(y.shape[0], -1)[:, :1]
+            cols.append(y)
+
+        if len(cols) == 0:
+            print("[evaluate_real] y_list 内无有效数组，跳过评估。")
+            return None
+
+        y_mat = _np.concatenate(cols, axis=1)  # (N, K)
+        N, K = y_mat.shape
+        print(f"[evaluate_real] 收到预测矩阵形状: {y_mat.shape} (N×K)")
+
+        # ---- 2) 如果存在模拟真值 tau（并且非空），仍然计算 PEHE（向后兼容）----
+        tau = getattr(self, "tau", None)
+        if tau is not None:
+            tau = _np.asarray(tau)
+            # 允许 tau 是 (N, K_true) 或 (N,) 或 (N,1)。若 K 不匹配就不算 PEHE。
+            if tau.size > 0:
+                if tau.ndim == 1:
+                    tau = tau.reshape(-1, 1)
+                elif tau.ndim >= 2:
+                    tau = tau.reshape(tau.shape[0], -1)
+                if tau.shape[0] == N and tau.shape[1] == K:
+                    pehe = _np.sqrt(_np.mean((tau - y_mat) ** 2))
+                    print(f"[evaluate_real] 检测到模拟真值，PEHE = {pehe:.6f}")
+                    return {"mode": "synthetic_with_tau", "PEHE": float(pehe)}
+                else:
+                    print(
+                        "[evaluate_real] 检测到 tau，但形状不匹配："
+                        f"tau={tau.shape}, y_mat={y_mat.shape}；跳过 PEHE。"
+                    )
+
+        # ---- 3) 真实数据：输出统计摘要（不计算 PEHE）----
+        # 统计：均值、标准差、分位数、若似概率则阳性率
+        means = _np.mean(y_mat, axis=0)
+        stds = _np.std(y_mat, axis=0)
+        q05 = _np.quantile(y_mat, 0.05, axis=0)
+        q25 = _np.quantile(y_mat, 0.25, axis=0)
+        q50 = _np.quantile(y_mat, 0.50, axis=0)
+        q75 = _np.quantile(y_mat, 0.75, axis=0)
+        q95 = _np.quantile(y_mat, 0.95, axis=0)
+
+        # 判定“像概率”：所有值均在[0,1]内
+        looks_prob = _np.isfinite(y_mat).all() and (y_mat >= 0.0).all() and (y_mat <= 1.0).all()
+        if looks_prob:
+            pos_rate = _np.mean(y_mat > threshold, axis=0)
+        else:
+            pos_rate = _np.full(K, _np.nan)
+
+        df = _pd.DataFrame({
+            "scenario_id": _np.arange(K),
+            "mean": means,
+            "std": stds,
+            "q05": q05, "q25": q25, "q50": q50, "q75": q75, "q95": q95,
+            "positive_rate" if looks_prob else "positive_rate(NaN)": pos_rate,
+        })
+
+        # 打印一个简表
+        with _pd.option_context("display.max_columns", None, "display.width", 120):
+            print("[evaluate_real] 真实数据：各干预场景预测摘要（前几行）：")
+            print(df.head(min(10, K)))
+
+        # 可选保存
+        if save_path:
+            try:
+                df.to_csv(save_path, index=False)
+                print(f"[evaluate_real] 摘要已保存到: {save_path}")
+            except Exception as e:
+                print(f"[evaluate_real] 保存 CSV 失败: {e}")
+
+        return {
+            "mode": "real_no_tau",
+            "summary": df,
+            "looks_prob": bool(looks_prob),
+            "threshold": float(threshold) if looks_prob else None,
+            "shape": (int(N), int(K)),
+        }
+
+    def evaluate_real0(self, y_list):
 
         y_mat_true = np.concatenate(self.outcome_list, axis=-1)
 

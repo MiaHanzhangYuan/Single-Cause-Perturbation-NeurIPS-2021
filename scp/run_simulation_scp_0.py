@@ -1,6 +1,5 @@
 import argparse
 import shutil
-from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -62,9 +61,292 @@ def get_scp_data_potential_cause(x_train, model, data_gen=None, oracle=False):
         y_train = data_gen.generate_counterfactual(causes)
         y_train = torch.tensor(y_train).to(x_train)  # pylint: disable=not-callable
     return y_train
-
-
 def run(
+    d_config,
+    ablate=None,
+    hyper_param_itr=5,
+    train_ratio=None,
+    eval_only=False,
+    eval_delta=False,
+    save_data=False,
+    seed=None,
+    no_confounder=False,
+    linear_model=False,
+    outcome_interaction3=False,
+    dense_connection=False,
+):
+    # ---- 1) 读取 config（初始值，稍后会被真实数据推断覆盖） ----
+    n_confounder = d_config.n_confounder
+    n_cause = d_config.n_cause
+    n_outcome = d_config.n_outcome
+    sample_size = d_config.sample_size
+    p_confounder_cause = d_config.p_confounder_cause
+    p_cause_cause = d_config.p_cause_cause
+    cause_noise = d_config.cause_noise
+    outcome_noise = d_config.outcome_noise
+    linear = d_config.linear
+    p_outcome_single = d_config.p_outcome_single
+    p_outcome_double = d_config.p_outcome_double
+    outcome_interaction = d_config.outcome_interaction
+    sample_size_train = d_config.sample_size_train
+    n_flip = d_config.n_flip
+
+    if ablate is None:
+        ablate = sim_config.AblationConfig()
+
+    max_epoch = 100
+    model_id = "SCP" if not ablate.is_ablate else f"SCP-{ablate.ablation_id}"
+    model_path = f"model/{model_id}_{d_config.sim_id}_model/"
+
+    if not eval_only:
+        try:
+            shutil.rmtree(model_path)
+        except OSError as e:
+            print("shutil note: %s - %s." % (e.filename, e.strerror))
+
+    if seed is None:
+        seed = 100
+
+    if train_ratio is None:
+        train_ratio = 1 if d_config.real_data else (sample_size / 1000)
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    # ---- 2) 构造数据生成器并真正生成数据 ----
+    if sample_size_train == 0:
+        dg = DataGenerator(
+            n_confounder, n_cause, n_outcome, sample_size,
+            p_confounder_cause, p_cause_cause, cause_noise, outcome_noise,
+            linear=linear,
+            confounding_level=d_config.confounding_level,
+            real_data=d_config.real_data,
+            train_frac=0.7 / train_ratio,
+            val_frac=0.1 / train_ratio,
+            p_outcome_single=p_outcome_single,
+            p_outcome_double=p_outcome_double,
+            outcome_interaction=outcome_interaction,
+            no_confounder=no_confounder,
+            outcome_interaction3=outcome_interaction3,
+        )
+    else:
+        valid_sample_size = 200
+        eval_sample_size = 4100
+        train_sample_size = sample_size_train
+        sample_size = train_sample_size + valid_sample_size + eval_sample_size
+        dg = DataGenerator(
+            n_confounder, n_cause, n_outcome, sample_size,
+            p_confounder_cause, p_cause_cause, cause_noise, outcome_noise,
+            linear=linear,
+            confounding_level=d_config.confounding_level,
+            real_data=d_config.real_data,
+            train_frac=train_sample_size / sample_size,
+            val_frac=valid_sample_size / sample_size,
+            p_outcome_single=p_outcome_single,
+            p_outcome_double=p_outcome_double,
+            outcome_interaction=outcome_interaction,
+            no_confounder=no_confounder,
+            outcome_interaction3=outcome_interaction3,
+        )
+
+    train_dataset, valid_dataset, x_test, y_test = dg.generate_dataset()
+
+    # ✅ 3) 用 DataGenerator 真实推断到的列数覆盖（关键！）
+    #    这样 get_scp_config 的 randint 才不会因为 n_confounder=0 报错
+    n_confounder = getattr(dg, "n_confounder", n_confounder or 1)
+    n_cause = getattr(dg, "n_cause", n_cause or max(1, x_test.shape[1] - n_confounder))
+    if y_test is not None:
+        n_outcome = getattr(dg, "n_outcome", n_outcome or y_test.shape[1])
+
+    # 合成数据才会有 counterfactual test；真实数据不用
+    if not d_config.real_data:
+        new_x_test, cate_test = dg.generate_counterfactual_test(n_flip)
+
+    # 真实数据用翻转生成的测试列表
+    new_x_list = dg.generate_test_real()  # 真实数据路径用得到
+    print(np.mean(dg.cause, axis=0))
+
+    # ---- 4) 先准备训练/验证集合的副本 ----
+    x_train_scp_list = [train_dataset.tensors[0].detach().clone()]
+    y_train_scp_list = [train_dataset.tensors[1].detach().clone()]
+    x_valid_scp_list = [valid_dataset.tensors[0].detach().clone()]
+    y_valid_scp_list = [valid_dataset.tensors[1].detach().clone()]
+
+    # ✅ 5) 超参列表用“覆盖后的” n_confounder
+    # 也顺手把 p_confounder_cause 钳一下，避免边界 low>=high
+    pc = float(p_confounder_cause)
+    pc = min(max(pc, 1e-6), 0.999)
+
+    param_list = (get_scp_config_three if dense_connection else get_scp_config)(
+        hyper_param_itr, n_confounder, pc
+    )
+    rmse = nn.MSELoss()
+
+    # ---- 6) 对每个 cause 训练 step-1 模型并做数据增强 ----
+    for single_cause_index in range(n_confounder, min(n_confounder + n_cause, n_confounder + ablate.perturb_subset)):
+        err_list = []
+
+        # 超参搜索
+        for param in param_list:
+            model_id_to_save = f"{model_id}_cause_{single_cause_index}_po_itr_{param.itr}"
+            model = create_DR_CRN(single_cause_index, d_config, param, linear_model)
+            optimizer = torch.optim.Adam(model.parameters(), lr=param.learning_rate)
+            trainer = ModelTrainer(param.batch_size, (max_epoch if not ablate.oracle_po else 1),
+                                   model.loss, model_id_to_save, model_path)
+            trainer.train(model, optimizer, train_dataset, valid_dataset, print_every=100)
+            load_model(model, model_path, model_id_to_save)
+
+            with torch.no_grad():
+                x_valid = x_valid_scp_list[0]
+                y_valid = y_valid_scp_list[0]
+                y_hat, log_propensity, mmd, treated_label = model(x_valid)
+                error = torch.sqrt(rmse(y_hat, y_valid))
+                print("Validation error:", round(error.item(), 3))
+                err_list.append(error.item())
+
+        best_index = int(np.argmin(np.array(err_list)))
+        best_param = param_list[best_index]
+        print("Best param:", best_param)
+        model_id_to_load = f"{model_id}_cause_{single_cause_index}_po_itr_{best_param.itr}"
+        model_id_best = f"{model_id}_cause_{single_cause_index}_po.pt"
+        model = create_DR_CRN(single_cause_index, d_config, best_param, linear_model)
+        _, model_file = load_model(model, model_path, model_id_to_load)
+        shutil.copy(model_path + model_file, model_path + model_id_best)
+
+        # 训练 potential cause（如需要）
+        if p_cause_cause > 0 and not ablate.exact_single_cause:
+            print("Training potential cause model")
+            k_cause = single_cause_index - n_confounder
+            res = dg.generate_dataset_potential_cause(k_cause, predict_all_causes=ablate.predict_all_causes)
+            if res is not None:
+                train_dataset_pcc, valid_dataset_pcc, x_test_pcc, y_test_pcc = res
+
+                model_id_pcc = f"{model_id}_potential_cause_{k_cause}"
+                single_cause_index_pcc = x_test_pcc.shape[1] - 1
+                n_confounder_pcc = x_test_pcc.shape[1] - 1
+                n_cause_pcc = 1
+                n_outcome_pcc = y_test_pcc.shape[1]
+
+                model_pcc = DR_CRN(
+                    single_cause_index_pcc,
+                    n_confounder_pcc,
+                    n_cause_pcc,
+                    n_outcome_pcc,
+                    n_confounder_rep=int(n_confounder * pc),
+                    n_outcome_rep=max(1, int(n_confounder * (1 - pc)) + 1),
+                    mmd_sigma=1.0,
+                    lam_factual=1.0,
+                    lam_propensity=1.0,
+                    lam_mmd=0.0,
+                    binary_outcome=True,
+                    linear=linear_model,
+                )
+                optimizer = torch.optim.Adam(model_pcc.parameters(), lr=0.005)
+                trainer = ModelTrainer(100, max_epoch, model_pcc.loss, model_id_pcc, model_path)
+                trainer.train(model_pcc, optimizer, train_dataset_pcc, valid_dataset_pcc)
+                model_pcc, _ = load_model(model_pcc, model_path, model_id_pcc)
+
+                with torch.no_grad():
+                    x_all, y_all = dg.generate_dataset_potential_cause(
+                        k_cause, return_dataset=False, predict_all_causes=ablate.predict_all_causes
+                    )
+                    x_all[:, single_cause_index_pcc] = 1 - x_all[:, single_cause_index_pcc]
+                    y_hat_prob = model_pcc(x_all)[0]
+                    potential_cause = torch.bernoulli(y_hat_prob)
+
+                    if ablate.oracle_potential_cause:
+                        x_single_cause_po = dg.get_x_potential_cause_oracle(k_cause)
+                    else:
+                        x_single_cause_po = dg.get_x_potential_cause(
+                            k_cause, potential_cause, predict_all_causes=ablate.predict_all_causes
+                        )
+
+                    y_single_cause_po = get_scp_data_potential_cause(
+                        x_single_cause_po, model, dg, ablate.oracle_po
+                    )
+                    train_dataset_new, valid_dataset_new, _, _ = dg.split_xy(x_single_cause_po, y_single_cause_po)
+                    x_train_scp, y_train_scp = train_dataset_new.tensors
+                    x_valid_scp, y_valid_scp = valid_dataset_new.tensors
+            else:
+                x_train_scp, y_train_scp = get_scp_data(
+                    train_dataset, single_cause_index, model, dg, ablate.oracle_po, True
+                )
+                x_valid_scp, y_valid_scp = get_scp_data(
+                    valid_dataset, single_cause_index, model, dg, ablate.oracle_po
+                )
+        else:
+            x_train_scp, y_train_scp = get_scp_data(train_dataset, single_cause_index, model)
+            x_valid_scp, y_valid_scp = get_scp_data(valid_dataset, single_cause_index, model)
+
+        x_train_scp_list.append(x_train_scp)
+        y_train_scp_list.append(y_train_scp)
+        x_valid_scp_list.append(x_valid_scp)
+        y_valid_scp_list.append(y_valid_scp)
+
+    # ---- 7) 聚合增强后的数据并训练 step-2 直接回归 ----
+    print(len(x_train_scp_list))
+    x_train = torch.cat(x_train_scp_list, dim=0)
+    y_train = torch.cat(y_train_scp_list, dim=0)
+    x_valid = torch.cat(x_valid_scp_list, dim=0)
+    y_valid = torch.cat(y_valid_scp_list, dim=0)
+
+    if save_data:
+        torch.save(x_train, f"{config_key}_{model_id}_{seed}_x.pth")
+        return 0
+
+    train_dataset = torch.utils.data.TensorDataset(x_train, y_train)
+    valid_dataset = torch.utils.data.TensorDataset(x_valid, y_valid)
+
+    batch_size = 100
+    model = DirectOutcomeRegression(
+        n_confounder, n_cause, n_outcome, n_hidden=n_confounder + n_cause + 1, linear=linear_model
+    )
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.005)
+    trainer = ModelTrainer(batch_size, max_epoch, rmse, model_id, model_path)
+    trainer.train(model, optimizer, train_dataset, valid_dataset, print_every=10)
+    torch.save(model, model_path + "best.pth")
+
+    # ---- 8) 评估 ----
+    if eval_delta and not d_config.real_data:
+        for j in range(n_cause):
+            n_flip = j + 1
+            new_x_test, cate_test = dg.generate_counterfactual_test(n_flip)
+            with torch.no_grad():
+                y_hat0 = model(x_test)
+                y_hat1 = model(new_x_test)
+                cate_hat = y_hat1 - y_hat0
+                error = torch.sqrt(rmse(cate_hat, cate_test))
+                rmse_sd = bootstrap_RMSE((cate_hat - cate_test) ** 2)
+                print("scp", n_flip, round(error.item(), 3), round(rmse_sd, 3))
+        return 0
+
+    with torch.no_grad():
+        y_list = []
+        for i in range(len(new_x_list)):
+            new_x = new_x_list[i]
+            y_hat = model(new_x).cpu().numpy()
+            y_list.append(y_hat)
+
+    if not d_config.real_data:
+        with torch.no_grad():
+            y_hat0 = model(x_test)
+            y_hat1 = model(new_x_test)
+            cate_hat = y_hat1 - y_hat0
+            error = torch.sqrt(rmse(cate_hat, cate_test))
+            rmse_sd = bootstrap_RMSE((cate_hat - cate_test) ** 2)
+
+            y_mat_true = np.concatenate(dg.outcome_list, axis=-1)
+            y_mat = np.concatenate(y_list, axis=-1)
+            n_test = y_mat.shape[0]
+            err_all = np.sum((y_mat_true[-n_test:, :] - y_mat) ** 2, axis=1)
+            rmse_all = np.sqrt(np.mean(err_all))
+            rmse_all_sd = bootstrap_RMSE(torch.tensor(err_all))
+            print(round(error.item(), 3), round(rmse_sd, 3), round(rmse_all, 3), round(rmse_all_sd, 3))
+    else:
+        dg.evaluate_real(y_list)
+
+
+def run0(
     d_config,
     ablate=None,
     hyper_param_itr=5,
@@ -99,6 +381,8 @@ def run(
         ablate = sim_config.AblationConfig()
 
     max_epoch = 100
+    # max_epoch = 5000
+    # max_epoch = 1000
     model_id = "SCP" if not ablate.is_ablate else "SCP-{}".format(ablate.ablation_id)
 
     model_path = "model/{}_{}_model/".format(model_id, d_config.sim_id)
@@ -175,35 +459,6 @@ def run(
 
     new_x_list = dg.generate_test_real()
 
-    # === 用真实数据推断的列数覆盖本地变量 ===
-    n_confounder = getattr(dg, "n_confounder", n_confounder or 1)
-    n_cause = getattr(dg, "n_cause", n_cause or max(1, x_test.shape[1] - n_confounder))
-    if y_test is not None:
-        n_outcome = getattr(dg, "n_outcome", n_outcome or y_test.shape[1])
-    else:
-        n_outcome = n_outcome or 1
-
-    # === 关键补丁：把推断出来的维度回填到一个可写的 config（d_cfg），后续模型都用它 ===
-    if hasattr(d_config, "_asdict"):   # NamedTuple
-        d_cfg = SimpleNamespace(**d_config._asdict())
-    else:
-        d_cfg = SimpleNamespace(**getattr(d_config, "__dict__", {}))
-
-    d_cfg.n_confounder = int(n_confounder)
-    d_cfg.n_cause = int(n_cause)
-    d_cfg.n_outcome = int(n_outcome)
-    d_cfg.p_confounder_cause = float(p_confounder_cause)
-    d_cfg.p_cause_cause = float(p_cause_cause)
-    d_cfg.linear = bool(linear)
-    d_cfg.confounding_level = getattr(d_config, "confounding_level", 1.0)
-    d_cfg.real_data = True
-    d_cfg.n_flip = int(n_flip)
-    d_cfg.sim_id = getattr(d_config, "sim_id", "real_adhoc")
-    d_cfg.sample_size_train = getattr(d_config, "sample_size_train", 0)
-    d_cfg.p_outcome_single = p_outcome_single
-    d_cfg.p_outcome_double = p_outcome_double
-    d_cfg.outcome_interaction = outcome_interaction
-
     print(np.mean(dg.cause, axis=0))
 
     # iterate over each cause
@@ -213,23 +468,19 @@ def run(
     x_valid_scp_list = [valid_dataset.tensors[0].detach().clone()]
     y_valid_scp_list = [valid_dataset.tensors[1].detach().clone()]
 
-    # clamp 概率，避免 randint(low>=high) 边界报错
-    pc = float(p_confounder_cause)
-    pc = min(max(pc, 1e-6), 0.999)
-    param_list = (get_scp_config_three if dense_connection else get_scp_config)(
-        hyper_param_itr, d_cfg.n_confounder, pc
-    )
+    param_list = get_scp_config(hyper_param_itr, n_confounder, p_confounder_cause)
+    if dense_connection:
+        param_list = get_scp_config_three(hyper_param_itr, n_confounder, p_confounder_cause)
     rmse = nn.MSELoss()
 
-    for single_cause_index in range(d_cfg.n_confounder, min(d_cfg.n_confounder + d_cfg.n_cause,
-                                                            d_cfg.n_confounder + ablate.perturb_subset)):
+    for single_cause_index in range(n_confounder, min(n_confounder + n_cause, n_confounder + ablate.perturb_subset)):
 
         err_list = list()
         # hyper-parameter search
         for param in param_list:
             # train single cause po model
             model_id_to_save = model_id + "_cause_{}_po_itr_{}".format(single_cause_index, param.itr)
-            model = create_DR_CRN(single_cause_index, d_cfg, param, linear_model)  # ← 用 d_cfg
+            model = create_DR_CRN(single_cause_index, d_config, param, linear_model)
             optimizer = torch.optim.Adam(model.parameters(), lr=param.learning_rate)
             if not ablate.oracle_po:
                 trainer = ModelTrainer(param.batch_size, max_epoch, model.loss, model_id_to_save, model_path)
@@ -247,8 +498,14 @@ def run(
 
                 y_hat, log_propensity, mmd, treated_label = model(x_valid)
                 propensity = torch.exp(log_propensity)[:, 1:2]
+                # print(treated_label)
+                # print(treated_label.shape)
 
+                weight = (treated_label * 1.0 - propensity) / (1.0 - propensity + 1e-9) / (propensity + 1e-9)
+                # print(weight)
+                # print(torch.sum(torch.isnan(weight)))
                 # error = torch.mean((weight * (y_hat - y_valid)) ** 2)
+                #
                 error = torch.sqrt(rmse(y_hat, y_valid))
                 print("Validation error:", round(error.item(), 3))
                 err_list.append(error.item())
@@ -259,7 +516,7 @@ def run(
         print("Best param:", best_param)
         model_id_to_load = model_id + "_cause_{}_po_itr_{}".format(single_cause_index, best_param.itr)
         model_id_best = model_id + "_cause_{}_po.pt".format(single_cause_index)
-        model = create_DR_CRN(single_cause_index, d_cfg, best_param, linear_model)  # ← 用 d_cfg
+        model = create_DR_CRN(single_cause_index, d_config, best_param, linear_model)
 
         # load best iteration
         _, model_file = load_model(model, model_path, model_id_to_load)
@@ -268,7 +525,7 @@ def run(
         # train potential cause model
         if p_cause_cause > 0 and not ablate.exact_single_cause:
             print("Training potential cause model")
-            k_cause = single_cause_index - d_cfg.n_confounder
+            k_cause = single_cause_index - n_confounder
             res = dg.generate_dataset_potential_cause(k_cause, predict_all_causes=ablate.predict_all_causes)
             if res is not None:
                 train_dataset_pcc, valid_dataset_pcc, x_test_pcc, y_test_pcc = res
@@ -287,8 +544,8 @@ def run(
                     n_confounder_pcc,
                     n_cause_pcc,
                     n_outcome_pcc,
-                    n_confounder_rep=int(d_cfg.n_confounder * pc),
-                    n_outcome_rep=max(1, int(d_cfg.n_confounder * (1 - pc)) + 1),
+                    n_confounder_rep=int(n_confounder * p_confounder_cause),
+                    n_outcome_rep=int(n_confounder * (1 - p_confounder_cause)) + 1,
                     mmd_sigma=1.0,
                     lam_factual=1.0,
                     lam_propensity=1.0,
@@ -313,6 +570,8 @@ def run(
                     potential_cause = torch.bernoulli(y_hat_prob)
 
                     # 2. get new x for single cause po
+                    # n_confounder + n_cause
+                    # todo: oracle potential cause
                     if ablate.oracle_potential_cause:
                         x_single_cause_po = dg.get_x_potential_cause_oracle(k_cause)
                     else:
@@ -321,6 +580,7 @@ def run(
                         )
 
                     # 3. get new y for single cause po
+                    # todo: oracle model
                     y_single_cause_po = get_scp_data_potential_cause(x_single_cause_po, model, dg, ablate.oracle_po)
 
                     # 4. split data
@@ -365,7 +625,7 @@ def run(
     # train model on aggregated dataset
     batch_size = 100
     model = DirectOutcomeRegression(
-        d_cfg.n_confounder, d_cfg.n_cause, d_cfg.n_outcome, n_hidden=d_cfg.n_confounder + d_cfg.n_cause + 1, linear=linear_model
+        n_confounder, n_cause, n_outcome, n_hidden=n_confounder + n_cause + 1, linear=linear_model
     )
     optimizer = torch.optim.SGD(model.parameters(), lr=0.005)
 
@@ -377,7 +637,7 @@ def run(
     # test on hold-out test data
 
     if eval_delta:
-        for j in range(d_cfg.n_cause):
+        for j in range(n_cause):
             n_flip = j + 1
             new_x_test, cate_test = dg.generate_counterfactual_test(n_flip)
             with torch.no_grad():
@@ -391,23 +651,12 @@ def run(
 
     with torch.no_grad():
         y_list = []
-        device = next(model.parameters()).device
         for i in range(len(new_x_list)):
             new_x = new_x_list[i]
-            # --- 修复点：确保是 torch.Tensor 并放到正确设备 ---
-            if isinstance(new_x, np.ndarray):
-                new_x = torch.from_numpy(new_x).float()
-            elif isinstance(new_x, torch.Tensor):
-                new_x = new_x.float()
-            else:
-                raise TypeError(f"Unexpected type for new_x: {type(new_x)}")
-            new_x = new_x.to(device)
-
-            y_hat = model(new_x).detach().cpu().numpy()
+            y_hat = model(new_x).cpu().numpy()
             y_list.append(y_hat)
 
-
-    if not d_cfg.real_data:
+    if not d_config.real_data:
         with torch.no_grad():
 
             y_hat0 = model(x_test)
@@ -430,6 +679,17 @@ def run(
 
 
 if __name__ == "__main__":
+    # config1 = sim_config.sim_dict['real_3000']
+    # run(config1)
+
+    # config1 = sim_config.dependent_cause
+    # abl_config = None
+
+    # abl_config = sim_config.AblationConfig(perturb_subset=4, ablation_id='perturb_subset-4')
+    # abl_config = sim_config.AblationConfig(exact_single_cause=True, ablation_id='exact_single_cause')
+    # abl_config = sim_config.AblationConfig(predict_all_causes=True, ablation_id='predict_all_causes')
+    # run(config1, abl_config)
+
     # run ablation
     parser = argparse.ArgumentParser("Ablation")
     parser.add_argument("--ablation", type=str, default="None")

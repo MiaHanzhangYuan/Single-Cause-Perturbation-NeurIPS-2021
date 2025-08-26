@@ -18,42 +18,40 @@ from sim_data_gen import DataGeneratorConfig
 #
 # ablation study
 # P_CAUSE_CAUSE = 0.9
+#
 
 sim_dict = dict()
 
-config = DataGeneratorConfig(
-    n_confounder=17,
-    n_cause=5,
-    n_outcome=1,
-    sample_size=3080,
-    p_confounder_cause=0.3,
-    p_cause_cause=0.0,
-    cause_noise=1,
-    outcome_noise=0.01,
-    linear=True,
-    n_flip=1,
-    sim_id="real_3000",
-    real_data=True,
-)
-sim_dict["real_3000"] = config
+# ----------- Real data configs (自适应模式) -----------
 
+# 全量 real data（由 CSV 自动推断 n_confounder/n_cause/n_outcome）
+sim_dict["real_full"] = DataGeneratorConfig(
+    n_confounder=0, n_cause=0, n_outcome=0,
+    sample_size=-1,                # -1 表示全量
+    real_data=True,
+    p_confounder_cause=0.3,        # 设为 0.3，避免 randint 出错
+    p_cause_cause=0.0,
+    cause_noise=0.0, outcome_noise=0.0,
+    linear=True, n_flip=1,
+    sim_id="real_full",
+)
+
+# 子采样 real data
 for sample_size in [500, 1000, 1500, 2000, 2500]:
-    idd = "real_{}".format(sample_size)
-    config = DataGeneratorConfig(
-        n_confounder=17,
-        n_cause=5,
-        n_outcome=1,
+    sim_dict[f"real_{sample_size}"] = DataGeneratorConfig(
+        n_confounder=0, n_cause=0, n_outcome=0,
         sample_size=sample_size,
-        p_confounder_cause=0.3,
-        p_cause_cause=P_CAUSE_CAUSE,
-        cause_noise=1,
-        outcome_noise=0.01,
-        linear=True,
-        n_flip=1,
-        sim_id=idd,
         real_data=True,
+        p_confounder_cause=0.3,    # 同样设为 0.3
+        p_cause_cause=0.0,
+        cause_noise=0.0, outcome_noise=0.0,
+        linear=True, n_flip=1,
+        sim_id=f"real_{sample_size}",
     )
-    sim_dict[idd] = config
+
+
+
+
 
 
 for linear in [True, False]:
